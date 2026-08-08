@@ -25,7 +25,7 @@ For an existing deck, preserve native Beamer and add either attachment gradually
 \speech{Complete spoken explanation for this slide.}
 ```
 
-Allow `\note`, `\speech`, both in either order, or neither. Treat a missing item as empty. Allow native `frame` and `paperframe` in the same document. Generate order-based IDs such as `F001` for native frames; keep the slide and manuscript bound correctly within each build even when overlays produce multiple PDF pages.
+Allow `\note`, `\speech`, both in either order, or neither. Treat a missing item as empty. Accept both the native `frame` environment and `\frame{...}` shorthand, and allow native frames and `paperframe` in the same document. Generate order-based IDs such as `F001` for native frames; keep the slide and manuscript bound correctly within each build even when overlays produce multiple PDF pages.
 
 For a new deck or a revision needing stable cross-version identity, prefer:
 
