@@ -5,7 +5,7 @@ Maintain one LaTeX source for a Beamer deck and its spoken manuscript, then buil
 - `slides.pdf` — the projected Beamer deck;
 - `speaker_notes.pdf` — one page per physical slide output, with the slide thumbnail and private note on the left and the full speech on the right.
 
-The default builder is backward-compatible with ordinary Beamer. Existing `frame` environments remain unchanged, and `\note` or `\speech` can be added gradually. A strict mode preserves the stable-ID final-delivery contract.
+The default builder is backward-compatible with ordinary Beamer. Existing `frame` environments and `\frame{...}` shorthand remain unchanged, and `\note` or `\speech` can be added gradually. A strict mode preserves the stable-ID final-delivery contract.
 
 ## Existing Beamer deck
 
