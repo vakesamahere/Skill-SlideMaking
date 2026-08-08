@@ -10,6 +10,8 @@ Accept an unchanged native Beamer frame:
 \end{frame}
 ```
 
+Also accept the common `\frame[options]{contents}` shorthand, including an optional overlay specification before the options.
+
 Allow zero, one, or both manuscript attachments immediately after it:
 
 ```tex
