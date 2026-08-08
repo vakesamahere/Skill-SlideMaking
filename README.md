@@ -3,23 +3,22 @@
 Maintain one LaTeX source for a Beamer deck and its spoken manuscript, then build two synchronized PDFs:
 
 - `slides.pdf` — the projected Beamer deck;
-- `speaker_notes.pdf` — one page per slide, with the slide thumbnail and private note on the left and the full speech on the right.
+- `speaker_notes.pdf` — one page per physical slide output, with the slide thumbnail and private note on the left and the full speech on the right.
 
-The builder binds every page by a stable slide ID and stops on duplicate or missing IDs, missing notes or speeches, overlays, or any compiled page-count mismatch. Inserting, deleting, or reordering a slide therefore cannot silently shift the manuscript onto the wrong page.
+The default builder is backward-compatible with ordinary Beamer. Existing `frame` environments and `\frame{...}` shorthand remain unchanged, and `\note` or `\speech` can be added gradually. A strict mode preserves the stable-ID final-delivery contract.
 
-## Quick start
+## Existing Beamer deck
 
-Copy `skill/assets/beamer-template.tex`, edit it, and keep this authoring contract for every slide:
+Keep native frames and attach zero, one, or both manuscript fields immediately afterward:
 
 ```tex
-\begin{paperframe}{S03}{Why this problem is hard}
-  % Normal Beamer frame content
-\end{paperframe}
-\note{A short private reminder, formula cue, or delivery instruction.}
+\begin{frame}{Why this problem is hard}
+  % Existing Beamer content, including overlays
+\end{frame}
 \speech{The complete spoken explanation for this slide.}
 ```
 
-Frame options are supported before the ID, for example `\begin{paperframe}[plain]{S01}{}`. IDs must be unique and stable; when inserting between `S04` and `S05`, prefer `S04A` instead of renumbering old slides.
+Missing attachments become empty areas in the notes PDF. `\note` and `\speech` may appear in either order. Native overlays, `\pause`, and `allowframebreaks` are supported: every physical slide output gets its own notes page, with the logical frame's manuscript repeated where needed.
 
 Build from the repository root:
 
@@ -27,18 +26,35 @@ Build from the repository root:
 python3 skill/scripts/build_dual_pdf.py path/to/talk.tex --output build
 ```
 
-The command writes both PDFs, a page-binding manifest, generated TeX used for diagnostics, and rendered PNGs when `pdftoppm` is available. It requires Python 3.10+, `latexmk`, XeLaTeX, and the LaTeX packages used by the source.
+Native frames receive diagnostic IDs such as `F001`. These remain correctly bound within a build but change when earlier native frames are inserted or deleted.
 
-## Contract and safety checks
+## Stable-ID authoring and strict mode
 
-- Use `paperframe`; raw `frame` environments are rejected.
-- Put exactly one `\note{...}` and one `\speech{...}` immediately after each `paperframe`.
-- Nested braces, equations, paragraphs, and Chinese text are parsed without flattening.
-- Overlays and multi-page frames are rejected because one logical slide must produce one PDF page.
-- The builder compiles slides first, verifies their page count, then generates the notes PDF with page `n` of `slides.pdf` bound to frame `n`.
-- A final manifest records `page`, `id`, and `title`, and both PDFs must have the same number of pages.
+For a new deck or cross-version r1/r2/r3 maintenance, prefer:
 
-For custom commands used only in the manuscript, add one brace-delimited block in the same source preamble:
+```tex
+\begin{paperframe}{S03}{Why this problem is hard}
+  % Normal Beamer frame content
+\end{paperframe}
+\note{A short private reminder.}
+\speech{The complete spoken explanation.}
+```
+
+IDs must be unique and stable. Insert `S04A` between `S04` and `S05` rather than renumbering unchanged slides.
+
+Run the stronger final-delivery checks with:
+
+```bash
+python3 skill/scripts/build_dual_pdf.py path/to/talk.tex --output build --strict
+```
+
+Strict mode requires every frame to use `paperframe`, both attachments to be explicit, and every logical frame to produce exactly one PDF page. It rejects overlays and multi-page frames.
+
+The builder writes both PDFs, generated TeX for diagnostics, `page_map.json` with physical-to-logical page bindings, and rendered PNGs when `pdftoppm` is available. It requires Python 3.10+, `latexmk`, XeLaTeX, and the LaTeX packages used by the source.
+
+## Notes-only setup
+
+For commands used only in the manuscript, add one block in the source preamble:
 
 ```tex
 \NotesPreamble{
@@ -46,16 +62,14 @@ For custom commands used only in the manuscript, add one brace-delimited block i
 }
 ```
 
-The block is removed from the Beamer build and injected into the notes build. The user still maintains only one content source.
+The block is removed from the Beamer build and injected into the notes build.
 
 ## Tests
-
-Run the complete test suite with:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-Parser and validation tests have no third-party Python dependency. The integration test performs a real XeLaTeX build when the TeX toolchain is present. GitHub Actions installs the required TeX and CJK font packages and runs the same suite.
+The suite tests parser behavior, strict-mode regressions, real XeLaTeX dual-PDF builds, and native overlay page mapping. GitHub Actions installs the TeX toolchain and runs the same suite.
 
 No license has been selected yet.

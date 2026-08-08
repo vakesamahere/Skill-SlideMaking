@@ -1,8 +1,33 @@
-# Single-source contract
+# Single-source compatibility contract
 
-## Authoring grammar
+## Compatibility mode (default)
 
-Each logical page is one `paperframe` followed by one `note` and one `speech`:
+Accept an unchanged native Beamer frame:
+
+```tex
+\begin{frame}[optional frame options]{frame title}
+  Beamer body, including overlays or allowframebreaks
+\end{frame}
+```
+
+Also accept the common `\frame[options]{contents}` shorthand, including an optional overlay specification before the options.
+
+Allow zero, one, or both manuscript attachments immediately after it:
+
+```tex
+\note{private reminder}
+\speech{full spoken manuscript}
+```
+
+Allow the two commands in either order. Treat a missing attachment as empty. Support Beamer's optional `\note[item]{...}` argument. Strip attached manuscript commands from the generated slides source, so the original deck does not need to define `\speech`.
+
+Assign native frames order-based IDs (`F001`, `F002`, ...). These IDs are diagnostic rather than stable across insertions. Preserve binding within the current build by reading Beamer's `.nav` frame-page spans after compilation. When overlays or `allowframebreaks` produce multiple physical pages, create one notes page for each physical slide page and repeat the logical frame's note/speech.
+
+Allow native `frame` and `paperframe` environments in the same source.
+
+## Stable-ID authoring
+
+Prefer `paperframe` for new decks and incremental r1/r2/r3 revisions:
 
 ```tex
 \begin{paperframe}[optional frame options]{stable-ID}{frame title}
@@ -12,23 +37,24 @@ Each logical page is one `paperframe` followed by one `note` and one `speech`:
 \speech{full spoken manuscript}
 ```
 
-Whitespace and comments may appear between the three constructs. The order is fixed. The builder supports nested braces, escaped braces, `\verb`, paragraphs, equations, and Unicode text within the brace-delimited fields.
+Whitespace and comments may appear between the frame and attachments. The builder supports nested braces, escaped braces, `\verb`, paragraphs, equations, and Unicode text within brace-delimited fields.
 
 IDs match `[A-Za-z][A-Za-z0-9_.-]*`. Treat them as identity, not page numbers. Insert `S04A` between `S04` and `S05`; only create a full renumbering when explicitly requested.
 
+## Strict mode
+
+Run the builder with `--strict` to require the original final-delivery invariants:
+
+- every logical frame is a `paperframe` with a valid, unique stable ID;
+- both `\note` and `\speech` are written explicitly, though either may contain `{}`;
+- overlays, overlay specifications, `\pause`, and `allowframebreaks` are rejected;
+- every logical frame produces exactly one slide PDF page.
+
+Both modes fail for malformed frame syntax, duplicate explicit IDs, orphaned or duplicate attachments, an incomplete physical page map, unequal output PDF page counts, or missing-glyph warnings.
+
 ## Why binding cannot drift
 
-The builder creates one ordered `Frame` object per `paperframe`. That object contains the ID, title, body, note, and speech. It first emits and compiles Beamer frames in object order. After verifying that the slides PDF has exactly one page per object, it emits notes page `n` with page `n` of that exact slides PDF and the note/speech from object `n`.
-
-The build fails before delivery for:
-
-- duplicate or invalid IDs;
-- raw Beamer `frame` environments;
-- missing, reordered, or orphaned note/speech commands;
-- overlay commands/specifications or `allowframebreaks`;
-- slide PDF page count different from object count;
-- notes PDF page count different from slide count;
-- missing-glyph warnings.
+The builder creates one ordered `Frame` object containing body, ID, title, note, and speech. It compiles the slides, reads the physical page span emitted by Beamer for every frame, then emits each notes page from the exact physical slide page and its owning `Frame` object. This supports both a one-page strict frame and a compatibility frame that expands to several output pages.
 
 ## Notes-only setup
 
