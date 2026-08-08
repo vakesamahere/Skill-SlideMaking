@@ -1,6 +1,6 @@
 ---
 name: latex-paper-slides
-description: Create or revise an academic-paper presentation from one LaTeX source that builds synchronized Beamer slides and a page-by-page speaker-notes PDF with each slide thumbnail, private note, and full speech. Use for LaTeX PPT, Beamer, 论文汇报, reading-group or journal-club slides, 逐页备注稿/讲稿, dual-PDF slide-and-notes builds, or incremental r1/r2/r3 revisions. Covers paper classification, contribution/evidence analysis, concise visual slides, concrete technical explanations, stable slide IDs, build validation, timing checks, and rendered visual QA.
+description: Create or revise an academic-paper presentation from one LaTeX source that builds synchronized Beamer slides and a page-by-page speaker-notes PDF with each slide thumbnail, private note, and full speech. Use for existing native Beamer decks, gradual manuscript annotation, LaTeX PPT, 论文汇报, reading-group or journal-club slides, 逐页备注稿/讲稿, dual-PDF builds, or incremental r1/r2/r3 revisions. Covers backward-compatible frame parsing, optional note/speech, stable slide IDs, paper analysis, build validation, timing checks, and rendered visual QA.
 ---
 
 # LaTeX Paper Slides
@@ -10,13 +10,24 @@ Maintain one author-edited `.tex` source and generate two synchronized outputs:
 1. `slides.pdf` — concise 16:9 Beamer slides.
 2. `speaker_notes.pdf` — one page per slide: slide thumbnail and private `note` in the left column, full `speech` in the right column.
 
-Use the deterministic builder and contract below. Do not create a separate Markdown manuscript.
+Use the deterministic builder and compatibility rules below. Do not create a separate Markdown manuscript.
 
-## Establish the single-source contract
+## Choose an authoring mode
 
 Copy [assets/beamer-template.tex](assets/beamer-template.tex) and [assets/references-template.bib](assets/references-template.bib) into the deliverable folder. Keep figures in `figures/`.
 
-Write every slide as:
+For an existing deck, preserve native Beamer and add either attachment gradually:
+
+```tex
+\begin{frame}{Why the problem is hard}
+  % unchanged Beamer content, including overlays
+\end{frame}
+\speech{Complete spoken explanation for this slide.}
+```
+
+Allow `\note`, `\speech`, both in either order, or neither. Treat a missing item as empty. Allow native `frame` and `paperframe` in the same document. Generate order-based IDs such as `F001` for native frames; keep the slide and manuscript bound correctly within each build even when overlays produce multiple PDF pages.
+
+For a new deck or a revision needing stable cross-version identity, prefer:
 
 ```tex
 \begin{paperframe}{S03}{Why the problem is hard}
@@ -26,9 +37,9 @@ Write every slide as:
 \speech{Complete spoken explanation for this slide.}
 ```
 
-Use a stable, unique ID. To insert between `S04` and `S05`, prefer `S04A`; do not renumber unchanged slides. Put exactly one brace-delimited `\note` and `\speech` immediately after each `paperframe`. Nested braces and paragraphs are supported.
+Use a stable, unique ID. To insert between `S04` and `S05`, prefer `S04A`; do not renumber unchanged slides. Attach brace-delimited `\note` and/or `\speech` immediately after the frame. Nested braces and paragraphs are supported.
 
-Do not use raw `frame`, overlays, `\pause`, incremental-reveal commands, or `allowframebreaks`. One logical frame must compile to one PDF page. The builder rejects violations and compiled page mismatches.
+Use compatibility mode by default. It accepts native overlays, `\pause`, and multi-page frames; the notes PDF gets one page per physical slide output, repeating that logical frame's note/speech where necessary. Use `--strict` for final delivery when every frame must be a `paperframe`, both attachments must be explicit, and one logical frame must compile to exactly one PDF page.
 
 If notes need custom macros, put one `\NotesPreamble{...}` block in the same source preamble. The builder injects it only into the notes build.
 
@@ -75,7 +86,13 @@ Build early and after every material edit:
 python3 /path/to/this-skill/scripts/build_dual_pdf.py talk.tex --output build
 ```
 
-The command parses the source with a brace-aware scanner, validates IDs and attachments, compiles slides, checks one page per frame, generates the notes document from the same ordered frame objects, compiles it, verifies equal PDF page counts, writes `page_map.json`, and renders PNGs when `pdftoppm` is available.
+The command parses native `frame` and `paperframe` environments with a brace-aware scanner, compiles slides, reads Beamer's physical frame-page map, generates the notes document from the same ordered frame objects, verifies equal PDF page counts, writes `page_map.json`, and renders PNGs when `pdftoppm` is available.
+
+For the stronger final-delivery contract, run:
+
+```bash
+python3 /path/to/this-skill/scripts/build_dual_pdf.py talk.tex --output build --strict
+```
 
 Inspect every image under `build/review/slides/` and `build/review/speaker_notes/`. Check clipping, overflow, tiny text, contrast, broken CJK glyphs, missing figures, and the first/inserted/last ID bindings. Do not call a draft complete until source validation, both PDF builds, page-count checks, and rendered review pass.
 
