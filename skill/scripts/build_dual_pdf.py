@@ -41,6 +41,10 @@ class Frame:
     options: str
     note: str
     speech: str
+    kind: str
+    frame_end: int
+    has_note: bool
+    has_speech: bool
     start: int
     end: int
 
@@ -147,14 +151,6 @@ class Scanner:
             return None
         return self.group(cursor, "[", "]")
 
-    def named_command(self, pos: int, expected: str) -> tuple[str, int]:
-        pos = self.skip_trivia(pos)
-        parsed = self.command(pos)
-        if parsed is None or parsed[0] != expected:
-            found = "text" if parsed is None else f"\\{parsed[0]}"
-            raise SourceError(f"expected \\{expected} after frame, found {found}")
-        return self.group(parsed[1])
-
     def environment_name(self, command_end: int) -> tuple[str, int]:
         return self.group(command_end)
 
@@ -225,10 +221,53 @@ def _validate_no_overlays(frame: Frame) -> None:
         raise SourceError(f"{frame.slide_id}: Beamer overlay specification is not allowed")
 
 
-def _parse_frame(scanner: Scanner, start: int, begin_command_end: int) -> Frame:
+def _parse_attachments(
+    scanner: Scanner, pos: int, *, strict: bool
+) -> tuple[str, str, bool, bool, int]:
+    """Read zero, one, or both note/speech commands immediately after a frame."""
+    note = ""
+    speech = ""
+    has_note = False
+    has_speech = False
+    end = pos
+    while True:
+        cursor = scanner.skip_trivia(end)
+        parsed = scanner.command(cursor)
+        if parsed is None or parsed[0] not in {"note", "speech"}:
+            break
+        name, command_end = parsed
+        if name == "note":
+            optional = scanner.optional_group(command_end)
+            if optional:
+                _, command_end = optional
+        content, group_end = scanner.group(command_end)
+        if name == "note":
+            if has_note:
+                raise SourceError("duplicate \\note attachment after frame")
+            note = content
+            has_note = True
+        else:
+            if has_speech:
+                raise SourceError("duplicate \\speech attachment after frame")
+            speech = content
+            has_speech = True
+        end = group_end
+    if strict and not (has_note and has_speech):
+        missing = []
+        if not has_note:
+            missing.append("\\note")
+        if not has_speech:
+            missing.append("\\speech")
+        raise SourceError("missing required attachment(s): " + ", ".join(missing))
+    return note, speech, has_note, has_speech, end
+
+
+def _parse_paperframe(
+    scanner: Scanner, start: int, begin_command_end: int, *, strict: bool
+) -> Frame:
     env, cursor = scanner.environment_name(begin_command_end)
     if env.strip() != "paperframe":
-        raise AssertionError("_parse_frame called for a different environment")
+        raise AssertionError("_parse_paperframe called for a different environment")
     optional = scanner.optional_group(cursor)
     if optional:
         options, cursor = optional
@@ -264,8 +303,9 @@ def _parse_frame(scanner: Scanner, start: int, begin_command_end: int) -> Frame:
                 )
             if name == "end" and nested_env == "paperframe":
                 body = scanner.text[body_start:cursor]
-                note, note_end = scanner.named_command(env_end, "note")
-                speech, speech_end = scanner.named_command(note_end, "speech")
+                note, speech, has_note, has_speech, attachment_end = _parse_attachments(
+                    scanner, env_end, strict=strict
+                )
                 frame = Frame(
                     slide_id=slide_id,
                     title=title,
@@ -273,15 +313,89 @@ def _parse_frame(scanner: Scanner, start: int, begin_command_end: int) -> Frame:
                     options=options.strip(),
                     note=note,
                     speech=speech,
+                    kind="paperframe",
+                    frame_end=env_end,
+                    has_note=has_note,
+                    has_speech=has_speech,
                     start=start,
-                    end=speech_end,
+                    end=attachment_end,
                 )
-                _validate_no_overlays(frame)
+                if strict:
+                    _validate_no_overlays(frame)
                 return frame
             cursor = env_end
             continue
         cursor = command_end
     raise SourceError(f"{slide_id}: missing \\end{{paperframe}}")
+
+
+def _raw_frame_title(scanner: Scanner, pos: int, body: str) -> str:
+    """Extract a conventional frame title when it is easy to do so."""
+    optional = scanner.optional_group(pos)
+    if optional:
+        _, pos = optional
+    pos = scanner.skip_trivia(pos)
+    if pos < scanner.length and scanner.text[pos] == "{":
+        title, _ = scanner.group(pos)
+        return title
+    match = re.search(r"\\frametitle\s*\{([^{}]*)\}", body)
+    return match.group(1) if match else ""
+
+
+def _parse_raw_frame(
+    scanner: Scanner,
+    start: int,
+    begin_command_end: int,
+    *,
+    ordinal: int,
+    strict: bool,
+) -> Frame:
+    if strict:
+        raise SourceError("raw frame environment found; use paperframe with a stable ID")
+    env, cursor = scanner.environment_name(begin_command_end)
+    if env.strip() != "frame":
+        raise AssertionError("_parse_raw_frame called for a different environment")
+    body_start = cursor
+    while cursor < scanner.length:
+        if scanner.text[cursor] == "%" and scanner._is_comment(cursor):
+            cursor = scanner.skip_comment(cursor)
+            continue
+        parsed = scanner.command(cursor) if scanner.text[cursor] == "\\" else None
+        if not parsed:
+            cursor += 1
+            continue
+        name, command_end = parsed
+        if name == "verb":
+            cursor = scanner.skip_verb(cursor, command_end)
+            continue
+        if name in {"begin", "end"}:
+            nested_env, env_end = scanner.environment_name(command_end)
+            nested_env = nested_env.strip()
+            if name == "begin" and nested_env in {"frame", "paperframe"}:
+                raise SourceError("frame environments cannot nest")
+            if name == "end" and nested_env == "frame":
+                body = scanner.text[body_start:cursor]
+                note, speech, has_note, has_speech, attachment_end = _parse_attachments(
+                    scanner, env_end, strict=False
+                )
+                return Frame(
+                    slide_id=f"F{ordinal:03d}",
+                    title=_raw_frame_title(scanner, body_start, body),
+                    body=body,
+                    options="",
+                    note=note,
+                    speech=speech,
+                    kind="frame",
+                    frame_end=env_end,
+                    has_note=has_note,
+                    has_speech=has_speech,
+                    start=start,
+                    end=attachment_end,
+                )
+            cursor = env_end
+            continue
+        cursor = command_end
+    raise SourceError(f"F{ordinal:03d}: missing \\end{{frame}}")
 
 
 def _find_notes_preamble(scanner: Scanner, preamble_end: int) -> tuple[str, tuple[int, int] | None]:
@@ -307,7 +421,7 @@ def _find_notes_preamble(scanner: Scanner, preamble_end: int) -> tuple[str, tupl
     return found if found is not None else ("", None)
 
 
-def parse_talk(source: str) -> Talk:
+def parse_talk(source: str, *, strict: bool = False) -> Talk:
     if not DOCUMENTCLASS_RE.search(source):
         raise SourceError("source must use \\documentclass{beamer}")
     scanner = Scanner(source)
@@ -331,12 +445,23 @@ def parse_talk(source: str) -> Talk:
             env, env_end = scanner.environment_name(command_end)
             env = env.strip()
             if env == "paperframe":
-                frame = _parse_frame(scanner, cursor, command_end)
+                frame = _parse_paperframe(
+                    scanner, cursor, command_end, strict=strict
+                )
                 frames.append(frame)
                 cursor = frame.end
                 continue
             if env == "frame":
-                raise SourceError("raw frame environment found; use paperframe with a stable ID")
+                frame = _parse_raw_frame(
+                    scanner,
+                    cursor,
+                    command_end,
+                    ordinal=len(frames) + 1,
+                    strict=strict,
+                )
+                frames.append(frame)
+                cursor = frame.end
+                continue
             cursor = env_end
             continue
         if name in {"note", "speech"}:
@@ -344,7 +469,7 @@ def parse_talk(source: str) -> Talk:
         cursor = command_end
 
     if not frames:
-        raise SourceError("no paperframe environments found")
+        raise SourceError("no frame or paperframe environments found")
     seen: set[str] = set()
     for frame in frames:
         if frame.slide_id in seen:
@@ -358,12 +483,15 @@ def render_slides_tex(talk: Talk) -> str:
     if talk.notes_preamble_span:
         replacements.append((*talk.notes_preamble_span, ""))
     for frame in talk.frames:
-        option = f"[{frame.options}]" if frame.options else ""
-        title = f"{{{frame.title}}}" if frame.title.strip() else ""
-        rendered = (
-            f"% SLIDE-ID: {frame.slide_id}\n"
-            f"\\begin{{frame}}{option}{title}{frame.body}\\end{{frame}}"
-        )
+        if frame.kind == "frame":
+            rendered = talk.source[frame.start : frame.frame_end]
+        else:
+            option = f"[{frame.options}]" if frame.options else ""
+            title = f"{{{frame.title}}}" if frame.title.strip() else ""
+            rendered = (
+                f"% SLIDE-ID: {frame.slide_id}\n"
+                f"\\begin{{frame}}{option}{title}{frame.body}\\end{{frame}}"
+            )
         replacements.append((frame.start, frame.end, rendered))
     result = talk.source
     for start, end, replacement in sorted(replacements, reverse=True):
@@ -383,14 +511,25 @@ def _notes_font_setup() -> str:
 """
 
 
-def render_notes_tex(talk: Talk, slides_pdf: Path) -> str:
+def render_notes_tex(
+    talk: Talk,
+    slides_pdf: Path,
+    page_bindings: list[tuple[int, Frame, int, int]] | None = None,
+) -> str:
     pages: list[str] = []
     pdf_path = str(slides_pdf.resolve()).replace("\\", "/")
-    for page, frame in enumerate(talk.frames, 1):
+    if page_bindings is None:
+        page_bindings = [
+            (page, frame, 1, 1) for page, frame in enumerate(talk.frames, 1)
+        ]
+    for page, frame, logical_page, logical_pages in page_bindings:
+        page_suffix = (
+            f" (output {logical_page}/{logical_pages})" if logical_pages > 1 else ""
+        )
         pages.append(
             rf"""
 \thispagestyle{{empty}}
-\noindent{{\sffamily\bfseries\large {frame.slide_id} — {frame.title}}}\par
+\noindent{{\sffamily\bfseries\large {frame.slide_id}{page_suffix} — {frame.title}}}\par
 \vspace{{0.6em}}
 \noindent
 \begin{{minipage}}[t][0.90\textheight][t]{{0.35\textwidth}}
@@ -489,25 +628,71 @@ def _render_pdf(pdf: Path, destination: Path) -> None:
     )
 
 
-def build(source_path: Path, output_dir: Path, render: bool = True) -> dict[str, object]:
+def _page_bindings(
+    talk: Talk, output_dir: Path, slide_pages: int, *, strict: bool
+) -> list[tuple[int, Frame, int, int]]:
+    """Map each physical Beamer output page back to its logical source frame."""
+    nav_path = output_dir / "slides.nav"
+    spans: list[tuple[int, int]] = []
+    if nav_path.is_file():
+        nav = nav_path.read_text(encoding="utf-8", errors="replace")
+        spans = [
+            (int(start), int(end))
+            for start, end in re.findall(
+                r"\\beamer@framepages\s*\{(\d+)\}\{(\d+)\}", nav
+            )
+        ]
+    if len(spans) != len(talk.frames):
+        if slide_pages == len(talk.frames):
+            spans = [(page, page) for page in range(1, slide_pages + 1)]
+        else:
+            raise RuntimeError(
+                "could not map Beamer output pages to source frames; "
+                f"found {len(spans)} frame spans for {len(talk.frames)} frames"
+            )
+    bindings: list[tuple[int, Frame, int, int]] = []
+    for frame, (start, end) in zip(talk.frames, spans):
+        if end < start:
+            raise RuntimeError(f"invalid Beamer page span for {frame.slide_id}: {start}-{end}")
+        count = end - start + 1
+        if strict and count != 1:
+            raise RuntimeError(
+                f"{frame.slide_id} produced {count} PDF pages in strict mode"
+            )
+        for logical_page, page in enumerate(range(start, end + 1), 1):
+            bindings.append((page, frame, logical_page, count))
+    physical_pages = [item[0] for item in bindings]
+    if physical_pages != list(range(1, slide_pages + 1)):
+        raise RuntimeError(
+            "Beamer frame-page map does not cover slides.pdf exactly: "
+            f"{physical_pages!r} vs 1..{slide_pages}"
+        )
+    return bindings
+
+
+def build(
+    source_path: Path,
+    output_dir: Path,
+    render: bool = True,
+    *,
+    strict: bool = False,
+) -> dict[str, object]:
     source_path = source_path.resolve()
     output_dir = output_dir.resolve()
     source = source_path.read_text(encoding="utf-8")
-    talk = parse_talk(source)
+    talk = parse_talk(source, strict=strict)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     slides_tex = output_dir / "slides.generated.tex"
     slides_tex.write_text(render_slides_tex(talk), encoding="utf-8")
     slides_pdf = _compile(slides_tex, output_dir, "slides", source_path.parent)
     slide_pages = pdf_page_count(slides_pdf)
-    if slide_pages != len(talk.frames):
-        raise RuntimeError(
-            f"slides.pdf has {slide_pages} pages for {len(talk.frames)} frames; "
-            "overlays or multi-page frames are not allowed"
-        )
+    page_bindings = _page_bindings(talk, output_dir, slide_pages, strict=strict)
 
     notes_tex = output_dir / "speaker_notes.generated.tex"
-    notes_tex.write_text(render_notes_tex(talk, slides_pdf), encoding="utf-8")
+    notes_tex.write_text(
+        render_notes_tex(talk, slides_pdf, page_bindings), encoding="utf-8"
+    )
     notes_pdf = _compile(notes_tex, output_dir, "speaker_notes", source_path.parent)
     note_pages = pdf_page_count(notes_pdf)
     if note_pages != slide_pages:
@@ -522,8 +707,16 @@ def build(source_path: Path, output_dir: Path, render: bool = True) -> dict[str,
         "slides_pdf": str(slides_pdf),
         "speaker_notes_pdf": str(notes_pdf),
         "pages": [
-            {"page": index, "id": frame.slide_id, "title": frame.title.strip()}
-            for index, frame in enumerate(talk.frames, 1)
+            {
+                "page": page,
+                "id": frame.slide_id,
+                "title": frame.title.strip(),
+                "frame_output_page": logical_page,
+                "frame_output_pages": logical_pages,
+                "has_note": frame.has_note,
+                "has_speech": frame.has_speech,
+            }
+            for page, frame, logical_page, logical_pages in page_bindings
         ],
     }
     (output_dir / "page_map.json").write_text(
@@ -541,13 +734,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=Path("build"))
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--no-render", action="store_true")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="require paperframe IDs, explicit note/speech, and one PDF page per frame",
+    )
     args = parser.parse_args(argv)
     try:
-        talk = parse_talk(args.source.read_text(encoding="utf-8"))
+        talk = parse_talk(args.source.read_text(encoding="utf-8"), strict=args.strict)
         if args.validate_only:
             print(f"OK: {len(talk.frames)} synchronized frames")
             return 0
-        manifest = build(args.source, args.output, render=not args.no_render)
+        manifest = build(
+            args.source, args.output, render=not args.no_render, strict=args.strict
+        )
         print(
             f"OK: built {len(manifest['pages'])} synchronized pages\n"
             f"  {manifest['slides_pdf']}\n  {manifest['speaker_notes_pdf']}"
