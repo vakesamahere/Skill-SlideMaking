@@ -60,11 +60,13 @@ class ParserTests(unittest.TestCase):
         source = talk_source(r"""\begin{frame}{Empty}A\end{frame}
 \begin{frame}{Note only}B\end{frame}\note[item]{N}
 \begin{frame}{Speech only}C\end{frame}\speech{P}
-\begin{paperframe}{S04A}{Both}D\end{paperframe}\speech{P2}\note{N2}""")
+\frame{\frametitle{Command shorthand}D}\note{NC}
+\begin{paperframe}{S04A}{Both}E\end{paperframe}\speech{P2}\note{N2}""")
         talk = builder.parse_talk(source)
-        self.assertEqual([f.slide_id for f in talk.frames], ["F001", "F002", "F003", "S04A"])
-        self.assertEqual([(f.has_note, f.has_speech) for f in talk.frames], [(False, False), (True, False), (False, True), (True, True)])
+        self.assertEqual([f.slide_id for f in talk.frames], ["F001", "F002", "F003", "F004", "S04A"])
+        self.assertEqual([(f.has_note, f.has_speech) for f in talk.frames], [(False, False), (True, False), (False, True), (True, False), (True, True)])
         self.assertEqual(talk.frames[1].note, "N")
+        self.assertEqual(talk.frames[3].title, "Command shorthand")
         slides = builder.render_slides_tex(talk)
         self.assertIn(r"\begin{frame}{Empty}A\end{frame}", slides)
         self.assertNotIn(r"\speech{P}", slides)
