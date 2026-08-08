@@ -1,0 +1,49 @@
+\documentclass[aspectratio=169,11pt]{beamer}
+\usepackage{fontspec}
+\setmainfont{Latin Modern Sans}
+\setsansfont{Latin Modern Sans}
+\usepackage{booktabs}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\title{Single-source slide demo}
+\author{Reading Group}
+\date{\today}
+
+\begin{document}
+
+\begin{paperframe}[plain]{S01}{}
+  \titlepage
+\end{paperframe}
+\note{Pause after naming the two outputs.}
+\speech{This small deck demonstrates one-source authoring. The same frame object drives both the projected slide and this manuscript page, so their content cannot drift apart.}
+
+\begin{paperframe}{S02A}{An inserted slide stays attached}
+  \begin{block}{Stable identity}
+    The ID is S02A even if its page number later changes.
+  \end{block}
+  \begin{itemize}
+    \item Slide content
+    \item Private note
+    \item Full speech
+  \end{itemize}
+\end{paperframe}
+\note{This is deliberately an insertion ID. Point to the page map during QA.}
+\speech{Suppose this slide was inserted between two existing pages. The builder reparses the ordered frames, assigns this object to the new page, and uses that same page index when embedding the slide thumbnail beside its note and speech. Later slides move together with their own content.}
+
+\begin{paperframe}{S03}{Build invariants}
+  \centering
+  \begin{tabular}{ll}
+    \toprule
+    Check & Required result \\
+    \midrule
+    IDs & unique and stable \\
+    Frames & one PDF page each \\
+    Outputs & equal page counts \\
+    \bottomrule
+  \end{tabular}
+\end{paperframe}
+\note{End by stating that a mismatch is an error, never a warning.}
+\speech{The invariant is straightforward: one stable ID maps to one frame, one private note, one speech, and one page in each PDF. The build stops if any of those counts disagree.}
+
+\end{document}

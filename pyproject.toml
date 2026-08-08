@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latex-paper-slides"
+version = "0.1.0"
+description = "Build synchronized Beamer slides and speaker notes from one LaTeX source"
+requires-python = ">=3.10"
+
+[project.scripts]
+latex-paper-slides = "build_dual_pdf:main"
+
+[tool.setuptools]
+py-modules = ["build_dual_pdf"]
+package-dir = {"" = "skill/scripts"}
