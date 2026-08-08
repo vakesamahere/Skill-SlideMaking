@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""Build synchronized Beamer slides and speaker notes from one LaTeX source."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+DOCUMENTCLASS_RE = re.compile(r"\\documentclass(?:\s*\[[^]]*\])?\s*\{beamer\}")
+FORBIDDEN_OVERLAY_COMMANDS = {
+    "pause",
+    "only",
+    "uncover",
+    "visible",
+    "invisible",
+    "onslide",
+    "alt",
+    "temporal",
+    "againframe",
+}
+
+
+class SourceError(ValueError):
+    """Raised when the single-source authoring contract is invalid."""
+
+
+@dataclass(frozen=True)
+class Frame:
+    slide_id: str
+    title: str
+    body: str
+    options: str
+    note: str
+    speech: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class Talk:
+    source: str
+    frames: tuple[Frame, ...]
+    notes_preamble: str
+    notes_preamble_span: tuple[int, int] | None
+
+
+class Scanner:
+    """Small brace-aware TeX scanner for the deliberately constrained DSL."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.length = len(text)
+
+    def _is_comment(self, pos: int) -> bool:
+        if self.text[pos] != "%":
+            return False
+        backslashes = 0
+        cursor = pos - 1
+        while cursor >= 0 and self.text[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        return backslashes % 2 == 0
+
+    def skip_comment(self, pos: int) -> int:
+        newline = self.text.find("\n", pos)
+        return self.length if newline < 0 else newline + 1
+
+    def skip_trivia(self, pos: int) -> int:
+        while pos < self.length:
+            if self.text[pos].isspace():
+                pos += 1
+            elif self.text[pos] == "%" and self._is_comment(pos):
+                pos = self.skip_comment(pos)
+            else:
+                break
+        return pos
+
+    def command(self, pos: int) -> tuple[str, int] | None:
+        if pos >= self.length or self.text[pos] != "\\":
+            return None
+        cursor = pos + 1
+        if cursor >= self.length:
+            return ("", cursor)
+        if self.text[cursor].isalpha() or self.text[cursor] == "@":
+            cursor += 1
+            while cursor < self.length and (
+                self.text[cursor].isalpha() or self.text[cursor] == "@"
+            ):
+                cursor += 1
+            return (self.text[pos + 1 : cursor], cursor)
+        return (self.text[cursor], cursor + 1)
+
+    def skip_verb(self, pos: int, command_end: int) -> int:
+        cursor = command_end
+        if cursor < self.length and self.text[cursor] == "*":
+            cursor += 1
+        if cursor >= self.length or self.text[cursor].isspace():
+            return cursor
+        delimiter = self.text[cursor]
+        closing = self.text.find(delimiter, cursor + 1)
+        if closing < 0:
+            raise SourceError(f"unterminated \\verb at character {pos}")
+        return closing + 1
+
+    def group(self, pos: int, opener: str = "{", closer: str = "}") -> tuple[str, int]:
+        pos = self.skip_trivia(pos)
+        if pos >= self.length or self.text[pos] != opener:
+            raise SourceError(f"expected {opener!r} at character {pos}")
+        start = pos + 1
+        depth = 1
+        cursor = start
+        while cursor < self.length:
+            char = self.text[cursor]
+            if char == "%" and self._is_comment(cursor):
+                cursor = self.skip_comment(cursor)
+                continue
+            if char == "\\":
+                parsed = self.command(cursor)
+                assert parsed is not None
+                name, command_end = parsed
+                if name == "verb":
+                    cursor = self.skip_verb(cursor, command_end)
+                else:
+                    cursor = command_end
+                continue
+            if char == opener:
+                depth += 1
+            elif char == closer:
+                depth -= 1
+                if depth == 0:
+                    return self.text[start:cursor], cursor + 1
+            cursor += 1
+        raise SourceError(f"unterminated {opener}{closer} group starting at {pos}")
+
+    def optional_group(self, pos: int) -> tuple[str, int] | None:
+        cursor = self.skip_trivia(pos)
+        if cursor >= self.length or self.text[cursor] != "[":
+            return None
+        return self.group(cursor, "[", "]")
+
+    def named_command(self, pos: int, expected: str) -> tuple[str, int]:
+        pos = self.skip_trivia(pos)
+        parsed = self.command(pos)
+        if parsed is None or parsed[0] != expected:
+            found = "text" if parsed is None else f"\\{parsed[0]}"
+            raise SourceError(f"expected \\{expected} after frame, found {found}")
+        return self.group(parsed[1])
+
+    def environment_name(self, command_end: int) -> tuple[str, int]:
+        return self.group(command_end)
+
+    def find_document_bounds(self) -> tuple[int, int]:
+        begin_end: int | None = None
+        cursor = 0
+        while cursor < self.length:
+            if self.text[cursor] == "%" and self._is_comment(cursor):
+                cursor = self.skip_comment(cursor)
+                continue
+            parsed = self.command(cursor) if self.text[cursor] == "\\" else None
+            if parsed:
+                name, command_end = parsed
+                if name == "verb":
+                    cursor = self.skip_verb(cursor, command_end)
+                    continue
+                if name in {"begin", "end"}:
+                    env, env_end = self.environment_name(command_end)
+                    if name == "begin" and env.strip() == "document":
+                        if begin_end is not None:
+                            raise SourceError("multiple document environments")
+                        begin_end = env_end
+                    elif name == "end" and env.strip() == "document":
+                        if begin_end is None:
+                            raise SourceError("document ends before it begins")
+                        return begin_end, cursor
+                    cursor = env_end
+                    continue
+                cursor = command_end
+                continue
+            cursor += 1
+        raise SourceError("missing complete \\begin{document} ... \\end{document}")
+
+
+def _visible_commands(text: str) -> list[str]:
+    scanner = Scanner(text)
+    commands: list[str] = []
+    cursor = 0
+    while cursor < scanner.length:
+        if text[cursor] == "%" and scanner._is_comment(cursor):
+            cursor = scanner.skip_comment(cursor)
+            continue
+        parsed = scanner.command(cursor) if text[cursor] == "\\" else None
+        if parsed:
+            name, end = parsed
+            if name == "verb":
+                cursor = scanner.skip_verb(cursor, end)
+            else:
+                commands.append(name)
+                cursor = end
+            continue
+        cursor += 1
+    return commands
+
+
+def _validate_no_overlays(frame: Frame) -> None:
+    if "allowframebreaks" in frame.options:
+        raise SourceError(f"{frame.slide_id}: allowframebreaks is not allowed")
+    commands = set(_visible_commands(frame.body))
+    forbidden = sorted(commands & FORBIDDEN_OVERLAY_COMMANDS)
+    if forbidden:
+        raise SourceError(
+            f"{frame.slide_id}: overlay command(s) are not allowed: "
+            + ", ".join(f"\\{item}" for item in forbidden)
+        )
+    # This complements command detection for forms such as \item<2->.
+    if re.search(r"\\[A-Za-z@]+\s*<\s*(?:\d|[+.-])", frame.body):
+        raise SourceError(f"{frame.slide_id}: Beamer overlay specification is not allowed")
+
+
+def _parse_frame(scanner: Scanner, start: int, begin_command_end: int) -> Frame:
+    env, cursor = scanner.environment_name(begin_command_end)
+    if env.strip() != "paperframe":
+        raise AssertionError("_parse_frame called for a different environment")
+    optional = scanner.optional_group(cursor)
+    if optional:
+        options, cursor = optional
+    else:
+        options = ""
+    slide_id, cursor = scanner.group(cursor)
+    title, cursor = scanner.group(cursor)
+    slide_id = slide_id.strip()
+    if not ID_RE.fullmatch(slide_id):
+        raise SourceError(f"invalid slide ID {slide_id!r}")
+
+    body_start = cursor
+    while cursor < scanner.length:
+        if scanner.text[cursor] == "%" and scanner._is_comment(cursor):
+            cursor = scanner.skip_comment(cursor)
+            continue
+        parsed = scanner.command(cursor) if scanner.text[cursor] == "\\" else None
+        if not parsed:
+            cursor += 1
+            continue
+        name, command_end = parsed
+        if name == "verb":
+            cursor = scanner.skip_verb(cursor, command_end)
+            continue
+        if name in {"begin", "end"}:
+            nested_env, env_end = scanner.environment_name(command_end)
+            nested_env = nested_env.strip()
+            if name == "begin" and nested_env == "paperframe":
+                raise SourceError(f"{slide_id}: paperframe environments cannot nest")
+            if name == "begin" and nested_env == "frame":
+                raise SourceError(
+                    f"{slide_id}: raw frame environment cannot appear inside paperframe"
+                )
+            if name == "end" and nested_env == "paperframe":
+                body = scanner.text[body_start:cursor]
+                note, note_end = scanner.named_command(env_end, "note")
+                speech, speech_end = scanner.named_command(note_end, "speech")
+                frame = Frame(
+                    slide_id=slide_id,
+                    title=title,
+                    body=body,
+                    options=options.strip(),
+                    note=note,
+                    speech=speech,
+                    start=start,
+                    end=speech_end,
+                )
+                _validate_no_overlays(frame)
+                return frame
+            cursor = env_end
+            continue
+        cursor = command_end
+    raise SourceError(f"{slide_id}: missing \\end{{paperframe}}")
+
+
+def _find_notes_preamble(scanner: Scanner, preamble_end: int) -> tuple[str, tuple[int, int] | None]:
+    found: tuple[str, tuple[int, int]] | None = None
+    cursor = 0
+    while cursor < preamble_end:
+        if scanner.text[cursor] == "%" and scanner._is_comment(cursor):
+            cursor = scanner.skip_comment(cursor)
+            continue
+        parsed = scanner.command(cursor) if scanner.text[cursor] == "\\" else None
+        if parsed:
+            name, end = parsed
+            if name == "NotesPreamble":
+                if found is not None:
+                    raise SourceError("use at most one \\NotesPreamble{...} block")
+                content, group_end = scanner.group(end)
+                found = (content, (cursor, group_end))
+                cursor = group_end
+                continue
+            cursor = scanner.skip_verb(cursor, end) if name == "verb" else end
+            continue
+        cursor += 1
+    return found if found is not None else ("", None)
+
+
+def parse_talk(source: str) -> Talk:
+    if not DOCUMENTCLASS_RE.search(source):
+        raise SourceError("source must use \\documentclass{beamer}")
+    scanner = Scanner(source)
+    body_start, body_end = scanner.find_document_bounds()
+    notes_preamble, notes_preamble_span = _find_notes_preamble(scanner, body_start)
+    frames: list[Frame] = []
+    cursor = body_start
+    while cursor < body_end:
+        if source[cursor] == "%" and scanner._is_comment(cursor):
+            cursor = scanner.skip_comment(cursor)
+            continue
+        parsed = scanner.command(cursor) if source[cursor] == "\\" else None
+        if not parsed:
+            cursor += 1
+            continue
+        name, command_end = parsed
+        if name == "verb":
+            cursor = scanner.skip_verb(cursor, command_end)
+            continue
+        if name == "begin":
+            env, env_end = scanner.environment_name(command_end)
+            env = env.strip()
+            if env == "paperframe":
+                frame = _parse_frame(scanner, cursor, command_end)
+                frames.append(frame)
+                cursor = frame.end
+                continue
+            if env == "frame":
+                raise SourceError("raw frame environment found; use paperframe with a stable ID")
+            cursor = env_end
+            continue
+        if name in {"note", "speech"}:
+            raise SourceError(f"orphan \\{name} outside a paperframe attachment")
+        cursor = command_end
+
+    if not frames:
+        raise SourceError("no paperframe environments found")
+    seen: set[str] = set()
+    for frame in frames:
+        if frame.slide_id in seen:
+            raise SourceError(f"duplicate slide ID: {frame.slide_id}")
+        seen.add(frame.slide_id)
+    return Talk(source, tuple(frames), notes_preamble, notes_preamble_span)
+
+
+def render_slides_tex(talk: Talk) -> str:
+    replacements: list[tuple[int, int, str]] = []
+    if talk.notes_preamble_span:
+        replacements.append((*talk.notes_preamble_span, ""))
+    for frame in talk.frames:
+        option = f"[{frame.options}]" if frame.options else ""
+        title = f"{{{frame.title}}}" if frame.title.strip() else ""
+        rendered = (
+            f"% SLIDE-ID: {frame.slide_id}\n"
+            f"\\begin{{frame}}{option}{title}{frame.body}\\end{{frame}}"
+        )
+        replacements.append((frame.start, frame.end, rendered))
+    result = talk.source
+    for start, end, replacement in sorted(replacements, reverse=True):
+        result = result[:start] + replacement + result[end:]
+    return result
+
+
+def _notes_font_setup() -> str:
+    return r"""
+\IfFontExistsTF{Noto Sans CJK SC}{
+  \setmainfont{Noto Sans CJK SC}
+  \setsansfont{Noto Sans CJK SC}
+}{
+  \setmainfont{Latin Modern Roman}
+  \setsansfont{Latin Modern Sans}
+}
+"""
+
+
+def render_notes_tex(talk: Talk, slides_pdf: Path) -> str:
+    pages: list[str] = []
+    pdf_path = str(slides_pdf.resolve()).replace("\\", "/")
+    for page, frame in enumerate(talk.frames, 1):
+        pages.append(
+            rf"""
+\thispagestyle{{empty}}
+\noindent{{\sffamily\bfseries\large {frame.slide_id} — {frame.title}}}\par
+\vspace{{0.6em}}
+\noindent
+\begin{{minipage}}[t][0.90\textheight][t]{{0.35\textwidth}}
+  \vspace{{0pt}}
+  \includegraphics[page={page},width=\linewidth]{{\detokenize{{{pdf_path}}}}}
+  \vspace{{0.8em}}
+
+  {{\sffamily\bfseries Note}}\par
+  \vspace{{0.25em}}
+  {{\small {frame.note}}}
+\end{{minipage}}\hfill
+\begin{{minipage}}[t][0.90\textheight][t]{{0.61\textwidth}}
+  \vspace{{0pt}}
+  {{\sffamily\bfseries Speech}}\par
+  \vspace{{0.35em}}
+  {frame.speech}
+\end{{minipage}}
+\clearpage
+"""
+        )
+    return rf"""\documentclass[11pt,a4paper]{{article}}
+\usepackage[margin=12mm]{{geometry}}
+\usepackage{{iftex}}
+\ifXeTeX\else
+  \PackageError{{speaker-notes}}{{Compile with XeLaTeX}}{{Use the supplied builder}}
+\fi
+\usepackage{{fontspec}}
+{_notes_font_setup()}
+\usepackage{{amsmath,amssymb,booktabs,graphicx,tikz,xcolor}}
+\usepackage{{microtype}}
+\setlength{{\parindent}}{{0pt}}
+\setlength{{\parskip}}{{0.55em}}
+\raggedbottom
+{talk.notes_preamble}
+\begin{{document}}
+{''.join(pages)}
+\end{{document}}
+"""
+
+
+def pdf_page_count(path: Path) -> int:
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        return len(PdfReader(str(path)).pages)
+    except ImportError:
+        if not shutil.which("pdfinfo"):
+            raise RuntimeError("need pypdf or pdfinfo to verify PDF page counts")
+        result = subprocess.run(
+            ["pdfinfo", str(path)], check=True, capture_output=True, text=True
+        )
+        match = re.search(r"^Pages:\s+(\d+)\s*$", result.stdout, re.MULTILINE)
+        if not match:
+            raise RuntimeError(f"could not read page count from {path}")
+        return int(match.group(1))
+
+
+def _compile(tex_path: Path, output_dir: Path, jobname: str, cwd: Path) -> Path:
+    if not shutil.which("latexmk") or not shutil.which("xelatex"):
+        raise RuntimeError("latexmk and xelatex are required")
+    command = [
+        "latexmk",
+        "-xelatex",
+        "-interaction=nonstopmode",
+        "-halt-on-error",
+        "-file-line-error",
+        f"-outdir={output_dir.resolve()}",
+        f"-jobname={jobname}",
+        str(tex_path.resolve()),
+    ]
+    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+    if result.returncode:
+        tail = "\n".join((result.stdout + "\n" + result.stderr).splitlines()[-80:])
+        raise RuntimeError(f"{jobname} compilation failed:\n{tail}")
+    log_path = output_dir / f"{jobname}.log"
+    log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    if "Missing character:" in log:
+        lines = [line for line in log.splitlines() if "Missing character:" in line][:8]
+        raise RuntimeError(
+            f"{jobname} has missing glyphs; install/configure an appropriate font:\n"
+            + "\n".join(lines)
+        )
+    pdf = output_dir / f"{jobname}.pdf"
+    if not pdf.is_file():
+        raise RuntimeError(f"compiler did not create {pdf}")
+    return pdf
+
+
+def _render_pdf(pdf: Path, destination: Path) -> None:
+    if not shutil.which("pdftoppm"):
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    prefix = destination / "page"
+    subprocess.run(
+        ["pdftoppm", "-png", "-r", "120", str(pdf), str(prefix)], check=True
+    )
+
+
+def build(source_path: Path, output_dir: Path, render: bool = True) -> dict[str, object]:
+    source_path = source_path.resolve()
+    output_dir = output_dir.resolve()
+    source = source_path.read_text(encoding="utf-8")
+    talk = parse_talk(source)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    slides_tex = output_dir / "slides.generated.tex"
+    slides_tex.write_text(render_slides_tex(talk), encoding="utf-8")
+    slides_pdf = _compile(slides_tex, output_dir, "slides", source_path.parent)
+    slide_pages = pdf_page_count(slides_pdf)
+    if slide_pages != len(talk.frames):
+        raise RuntimeError(
+            f"slides.pdf has {slide_pages} pages for {len(talk.frames)} frames; "
+            "overlays or multi-page frames are not allowed"
+        )
+
+    notes_tex = output_dir / "speaker_notes.generated.tex"
+    notes_tex.write_text(render_notes_tex(talk, slides_pdf), encoding="utf-8")
+    notes_pdf = _compile(notes_tex, output_dir, "speaker_notes", source_path.parent)
+    note_pages = pdf_page_count(notes_pdf)
+    if note_pages != slide_pages:
+        raise RuntimeError(
+            f"speaker_notes.pdf has {note_pages} pages but slides.pdf has {slide_pages}; "
+            "shorten overflowing note/speech content"
+        )
+
+    manifest = {
+        "source": str(source_path),
+        "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "slides_pdf": str(slides_pdf),
+        "speaker_notes_pdf": str(notes_pdf),
+        "pages": [
+            {"page": index, "id": frame.slide_id, "title": frame.title.strip()}
+            for index, frame in enumerate(talk.frames, 1)
+        ],
+    }
+    (output_dir / "page_map.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    if render:
+        _render_pdf(slides_pdf, output_dir / "review" / "slides")
+        _render_pdf(notes_pdf, output_dir / "review" / "speaker_notes")
+    return manifest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path, help="single-source Beamer .tex file")
+    parser.add_argument("--output", type=Path, default=Path("build"))
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--no-render", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        talk = parse_talk(args.source.read_text(encoding="utf-8"))
+        if args.validate_only:
+            print(f"OK: {len(talk.frames)} synchronized frames")
+            return 0
+        manifest = build(args.source, args.output, render=not args.no_render)
+        print(
+            f"OK: built {len(manifest['pages'])} synchronized pages\n"
+            f"  {manifest['slides_pdf']}\n  {manifest['speaker_notes_pdf']}"
+        )
+        return 0
+    except (OSError, SourceError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
