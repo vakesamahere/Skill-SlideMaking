@@ -398,6 +398,44 @@ def _parse_raw_frame(
     raise SourceError(f"F{ordinal:03d}: missing \\end{{frame}}")
 
 
+def _parse_frame_command(
+    scanner: Scanner,
+    start: int,
+    command_end: int,
+    *,
+    ordinal: int,
+    strict: bool,
+) -> Frame:
+    r"""Parse Beamer's common shorthand: \frame[options]{contents}."""
+    if strict:
+        raise SourceError("raw \\frame command found; use paperframe with a stable ID")
+    cursor = scanner.skip_trivia(command_end)
+    if cursor < scanner.length and scanner.text[cursor] == "<":
+        _, cursor = scanner.group(cursor, "<", ">")
+    optional = scanner.optional_group(cursor)
+    if optional:
+        _, cursor = optional
+    body, frame_end = scanner.group(cursor)
+    note, speech, has_note, has_speech, attachment_end = _parse_attachments(
+        scanner, frame_end, strict=False
+    )
+    title_match = re.search(r"\\frametitle\s*\{([^{}]*)\}", body)
+    return Frame(
+        slide_id=f"F{ordinal:03d}",
+        title=title_match.group(1) if title_match else "",
+        body=body,
+        options="",
+        note=note,
+        speech=speech,
+        kind="frame-command",
+        frame_end=frame_end,
+        has_note=has_note,
+        has_speech=has_speech,
+        start=start,
+        end=attachment_end,
+    )
+
+
 def _find_notes_preamble(scanner: Scanner, preamble_end: int) -> tuple[str, tuple[int, int] | None]:
     found: tuple[str, tuple[int, int]] | None = None
     cursor = 0
@@ -464,6 +502,17 @@ def parse_talk(source: str, *, strict: bool = False) -> Talk:
                 continue
             cursor = env_end
             continue
+        if name == "frame":
+            frame = _parse_frame_command(
+                scanner,
+                cursor,
+                command_end,
+                ordinal=len(frames) + 1,
+                strict=strict,
+            )
+            frames.append(frame)
+            cursor = frame.end
+            continue
         if name in {"note", "speech"}:
             raise SourceError(f"orphan \\{name} outside a paperframe attachment")
         cursor = command_end
@@ -483,7 +532,7 @@ def render_slides_tex(talk: Talk) -> str:
     if talk.notes_preamble_span:
         replacements.append((*talk.notes_preamble_span, ""))
     for frame in talk.frames:
-        if frame.kind == "frame":
+        if frame.kind != "paperframe":
             rendered = talk.source[frame.start : frame.frame_end]
         else:
             option = f"[{frame.options}]" if frame.options else ""
